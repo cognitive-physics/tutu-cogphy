@@ -139,8 +139,3 @@ This repository is most suitable right now for:
 ## License
 
 This repository is currently distributed under the [MIT License](LICENSE).
-
-```
-
-要是你愿意，我下一步就直接给你一份 **主 README 的中文优先版**，风格会更贴你的仓库气质一点。
-```
