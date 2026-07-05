@@ -1,11 +1,12 @@
 """Local text complexity heuristics for the cognitive engine prototype."""
 
 import math
+import os
 import re
 import unicodedata
 import zlib
 from collections import Counter
-from typing import Optional
+from typing import Optional, Tuple
 
 MIN_WORDS = 5
 
@@ -34,6 +35,34 @@ NEUTRAL_INTENSITY_WORDS = {
     'very', 'really', 'extremely', 'absolutely', 'quite', 'rather',
     'very', '非常', '极其', '完全', '相当', '真的',
 }
+
+# Global state for embedding model
+_EMBEDDING_MODEL = None
+_EMBEDDING_MODEL_NAME = os.environ.get("COMPLEXITY_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+_USE_EMBEDDING = os.environ.get("COMPLEXITY_USE_EMBEDDING", "true").lower() == "true"
+
+
+def _load_embedding_model():
+    """Lazy-load embedding model, return None if unavailable."""
+    global _EMBEDDING_MODEL
+    
+    if not _USE_EMBEDDING:
+        return None
+    
+    if _EMBEDDING_MODEL is not None:
+        return _EMBEDDING_MODEL
+    
+    try:
+        from sentence_transformers import SentenceTransformer
+        _EMBEDDING_MODEL = SentenceTransformer(_EMBEDDING_MODEL_NAME)
+        return _EMBEDDING_MODEL
+    except ImportError:
+        # sentence-transformers not installed
+        return None
+    except Exception as e:
+        # Model download or loading failed
+        print(f"Warning: Failed to load embedding model {_EMBEDDING_MODEL_NAME}: {e}")
+        return None
 
 
 def _is_semantic_char(ch: str) -> bool:
@@ -78,19 +107,144 @@ def _length_penalty(text: str) -> float:
     return min(semantic_len / 10.0, 1.0)
 
 
-def compute_complexity(text: str) -> float:
+def _compute_complexity_heuristic(text: str) -> Tuple[float, str]:
+    """
+    Heuristic complexity (fallback): zlib compression + vocab entropy.
+    
+    Returns:
+        (complexity_score, method_label)
+    """
     if not text.strip():
-        return 0.0
+        return 0.0, "heuristic_empty"
+    
     w1, w2, w3 = 0.4, 0.3, 0.3
     base_score = (
         w1 * vocab_density(text)
         + w2 * compression_ratio(text)
         + w3 * entropy_score(text)
     )
-    return float(min(base_score * _length_penalty(text), 1.0))
+    score = float(min(base_score * _length_penalty(text), 1.0))
+    return score, "heuristic"
+
+
+def _compute_complexity_embedding(text: str) -> Tuple[Optional[float], str]:
+    """
+    Embedding-based complexity: semantic density via sentence embeddings.
+    
+    Approach:
+    - Split text into sentences
+    - Embed each sentence
+    - Measure average pairwise divergence (information diversity)
+    - Combine with vocabulary diversity
+    
+    High information density = high divergence between sentences (each sentence adds new info)
+    Low information density = high similarity (repetitive/redundant)
+    
+    Returns:
+        (complexity_score or None, method_label)
+    """
+    model = _load_embedding_model()
+    if model is None:
+        return None, "embedding_unavailable"
+    
+    if not text.strip():
+        return 0.0, "embedding_empty"
+    
+    try:
+        # Split into sentences (naive: by period/question mark)
+        sentences = re.split(r'[。！？\.\!\?]+', text.strip())
+        sentences = [s.strip() for s in sentences if s.strip()]
+        
+        if not sentences:
+            return 0.0, "embedding_no_sentences"
+        
+        if len(sentences) == 1:
+            # Single sentence: use word diversity as proxy
+            words = sentences[0].lower().split()
+            if not words:
+                return 0.0, "embedding_no_words"
+            diversity = len(set(words)) / len(words)
+            return float(min(diversity, 1.0)), "embedding_single_sentence"
+        
+        # Embed sentences
+        embeddings = model.encode(sentences, convert_to_tensor=False)
+        
+        # Compute pairwise cosine similarity (information overlap)
+        import numpy as np
+        embeddings = np.array(embeddings)
+        
+        # Normalize
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        embeddings_norm = embeddings / (norms + 1e-9)
+        
+        # Pairwise cosine similarities
+        similarities = embeddings_norm @ embeddings_norm.T
+        
+        # Average pairwise similarity (excluding self-similarity)
+        mask = 1.0 - np.eye(len(sentences))
+        avg_similarity = np.sum(similarities * mask) / np.sum(mask)
+        
+        # Information density: inverse of similarity (high divergence = high density)
+        # Clamp to [0, 1]
+        information_density = 1.0 - avg_similarity
+        information_density = float(np.clip(information_density, 0.0, 1.0))
+        
+        # Combine with vocabulary diversity
+        vocab_score = vocab_density(text)
+        combined_score = 0.6 * information_density + 0.4 * vocab_score
+        
+        return float(min(combined_score, 1.0)), "embedding"
+    
+    except Exception as e:
+        # Fallback on embedding error
+        print(f"Warning: Embedding-based complexity failed: {e}")
+        return None, f"embedding_error: {e}"
+
+
+def compute_complexity(text: str) -> float:
+    """
+    Compute semantic/information complexity of text.
+    
+    Tries embedding-based approach first (measures semantic information density).
+    Falls back to heuristic (zlib compression + entropy) if embedding unavailable.
+    
+    Args:
+        text: Input text
+    
+    Returns:
+        complexity: float in [0, 1]
+            0 = very simple (empty, repetitive, low information)
+            1 = very complex (high information density, diverse content)
+            Unit: dimensionless information density score.
+    """
+    # Try embedding-based first
+    score_emb, method_emb = _compute_complexity_embedding(text)
+    if score_emb is not None:
+        return score_emb
+    
+    # Fallback to heuristic
+    score_heur, method_heur = _compute_complexity_heuristic(text)
+    return score_heur
+
+
+def get_complexity_method(text: str) -> str:
+    """
+    Return which method was used for complexity computation.
+    
+    For debugging/logging purposes.
+    """
+    score_emb, method_emb = _compute_complexity_embedding(text)
+    if score_emb is not None:
+        return method_emb
+    return "heuristic"
 
 
 def complexity_ratio_between(text_a: str, text_b: str) -> float:
+    """
+    Ratio of complexities: cb / ca, clipped to [0, 1].
+    
+    Signature unchanged from v1 for backward compatibility.
+    """
     ca = compute_complexity(text_a)
     cb = compute_complexity(text_b)
     if ca < 1e-6:
