@@ -5,6 +5,7 @@ import re
 import unicodedata
 import zlib
 from collections import Counter
+from typing import Optional
 
 MIN_WORDS = 5
 
@@ -15,6 +16,24 @@ QUESTION_PATTERNS = [
     r'\b(doesn\'t|didn\'t|don\'t|won\'t|can\'t|couldn\'t|shouldn\'t)\b.*understand',
     r'\b(don\'t understand|没懂|什么意思|解释一下|再说一遍)\b',
 ]
+
+# Emotion lexicon (lightweight, Chinese-English)
+POSITIVE_WORDS = {
+    'good', 'great', 'excellent', 'wonderful', 'amazing', 'fantastic', 'happy',
+    'pleased', 'delighted', 'grateful', 'appreciate', 'love', 'like',
+    '好', '太好了', '太棒了', '很高兴', '感谢', '喜欢', '很满意',
+}
+
+NEGATIVE_WORDS = {
+    'bad', 'terrible', 'awful', 'horrible', 'hate', 'dislike', 'angry',
+    'frustrated', 'disappointed', 'sad', 'upset', 'afraid', 'worried',
+    '坏', '糟糕', '可怕', '讨厌', '不满', '失望', '害怕', '担心',
+}
+
+NEUTRAL_INTENSITY_WORDS = {
+    'very', 'really', 'extremely', 'absolutely', 'quite', 'rather',
+    'very', '非常', '极其', '完全', '相当', '真的',
+}
 
 
 def _is_semantic_char(ch: str) -> bool:
@@ -77,6 +96,47 @@ def complexity_ratio_between(text_a: str, text_b: str) -> float:
     if ca < 1e-6:
         return 1.0
     return float(min(cb / ca, 1.0))
+
+
+def estimate_emotion_score(text: str) -> float:
+    """
+    Estimate emotional tone from text using lightweight lexicon-based approach.
+    
+    Args:
+        text: Input text
+    
+    Returns:
+        emotion_score: float in [0, 1]
+            0.0 = negative/frustrated tone,
+            0.5 = neutral tone,
+            1.0 = positive/satisfied tone.
+            Unit: dimensionless emotional polarity score.
+    """
+    if not text or not text.strip():
+        return 0.5  # Neutral if empty
+    
+    text_lower = text.lower()
+    words = set(text_lower.split())
+    
+    positive_count = len(words & POSITIVE_WORDS)
+    negative_count = len(words & NEGATIVE_WORDS)
+    intensity_boost = len(words & NEUTRAL_INTENSITY_WORDS) * 0.1
+    
+    # Base score: neutral at 0.5
+    if positive_count == 0 and negative_count == 0:
+        return 0.5  # Neutral
+    
+    # Polarity: (positive - negative) / (positive + negative)
+    total = positive_count + negative_count
+    if total > 0:
+        polarity = (positive_count - negative_count) / total
+        # Map [-1, 1] to [0, 1]
+        emotion_score = 0.5 + polarity * 0.5
+        # Apply intensity boost (max 0.1 additional)
+        emotion_score = min(emotion_score + intensity_boost, 1.0)
+        return float(emotion_score)
+    
+    return 0.5
 
 
 def estimate_follow_up_rate(user_reply: str) -> float:
