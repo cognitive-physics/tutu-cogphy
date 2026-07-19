@@ -187,12 +187,17 @@ class Encoder:
     def _bayesian_update(self, new_est: Dict, n: int, missing_count: int) -> Tuple[Dict, float]:
         """Update uncertainty with missing channel penalty."""
         if not self.history:
-            base_uncertainty = 1.0
+            delta = 0.0
         else:
             prev_avg = np.mean([h["rho_raw"] for h in self.history])
             delta = abs(new_est["rho_raw"] - prev_avg)
-            session_bonus = 0.1 * (self.profile.session_count if self.profile else 0)
-            base_uncertainty = max(0.0, 1.0 / (1.0 + np.sqrt(n) + session_bonus) + delta)
+        session_bonus = 0.1 * (
+            self.profile.session_count if self.profile else 0
+        )
+        base_uncertainty = max(
+            0.0,
+            1.0 / (1.0 + np.sqrt(n) + session_bonus) + delta,
+        )
 
         # Penalize missing channels: increase R explicitly
         missing_penalty = missing_count * self.MISSING_CHANNEL_PENALTY
@@ -355,12 +360,25 @@ class VariationalDecisionEngine(DecisionEngine):
         pressure = event.env_pressure
         
         # Deviation from equilibrium: (a_i - σ*)²
-        deviation_term = np.sum((action_path - sigma_star) ** 2)
+        deviation_values = (action_path - sigma_star) ** 2
         
         # Pressure penalty: (a_i * pressure)²
-        pressure_term = np.sum((action_path * (1.0 + mu * pressure)) ** 2)
-        
-        return deviation_term + pressure_term
+        pressure_values = (
+            action_path * (1.0 + mu * pressure)
+        ) ** 2
+
+        values = deviation_values + pressure_values
+        if len(values) == 1:
+            return float(values[0])
+        step = 1.0 / (len(values) - 1)
+        return float(
+            step
+            * (
+                0.5 * values[0]
+                + np.sum(values[1:-1])
+                + 0.5 * values[-1]
+            )
+        )
 
     def _action_functional(self, action_path: np.ndarray, state: CognitiveState, event: Event) -> float:
         """
@@ -372,7 +390,10 @@ class VariationalDecisionEngine(DecisionEngine):
         """
         # Smoothness term: κ/2 * sum((a[i+1]-a[i])²)
         diffs = np.diff(action_path)
-        smoothness = (self.kappa / 2.0) * np.sum(diffs ** 2)
+        step = 1.0 / max(len(action_path) - 1, 1)
+        smoothness = (
+            self.kappa / (2.0 * step)
+        ) * np.sum(diffs ** 2)
         
         # Potential term
         potential = self._potential_term(action_path, state, event)
@@ -444,6 +465,21 @@ class VariationalDecisionEngine(DecisionEngine):
             }
         """
         try:
+            finite_inputs = (
+                np.all(np.isfinite(state.rho_0))
+                and np.all(np.isfinite(state.H_0))
+                and np.all(np.isfinite(state.sigma_star))
+                and np.isfinite(state.mu)
+                and np.isfinite(state.uncertainty)
+                and np.isfinite(event.rho_now)
+                and np.isfinite(event.env_pressure)
+                and np.isfinite(event.goal_horizon)
+            )
+            if not finite_inputs:
+                raise ValueError(
+                    "variational inputs must all be finite"
+                )
+
             # Initial guess: linear interpolation from 0 to sigma_star
             sigma_star = float(state.sigma_star[0])
             x0 = np.linspace(0.0, sigma_star, self.n_steps)
@@ -456,7 +492,11 @@ class VariationalDecisionEngine(DecisionEngine):
                 method="L-BFGS-B",
                 jac=self._action_functional_grad,
                 bounds=[(0.0, 1.0)] * self.n_steps,
-                options={"maxiter": 200, "ftol": 1e-6},
+                options={
+                    "maxiter": 1000,
+                    "ftol": 1e-12,
+                    "gtol": 1e-8,
+                },
             )
             
             if not result.success:

@@ -117,7 +117,11 @@ class TestVariationalDecisionEngine:
         diff_12_24 = abs(values[2] - values[1])
         
         # Later refinements should produce smaller changes
-        assert diff_12_24 < diff_6_12 * 1.5, "Convergence test: should stabilize"
+        numerical_floor = 1e-8
+        assert diff_12_24 < max(
+            diff_6_12 * 1.5,
+            numerical_floor,
+        ), "Convergence test: should stabilize"
 
     def test_fallback_on_forced_exception(self):
         """
